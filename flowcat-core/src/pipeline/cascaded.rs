@@ -268,6 +268,10 @@ pub trait ContextSummarizer: Send + Sync {
 pub struct SummarizerConfig {
     /// Fire the summarize hook once the rolling history reaches this many messages.
     pub trigger_after_messages: usize,
+    /// Keep this many most-recent messages verbatim; only the older messages are
+    /// folded into the summary. Prevents the compaction from discarding the live
+    /// turns the next LLM run still needs.
+    pub keep_recent_messages: usize,
 }
 
 impl Default for SummarizerConfig {
@@ -276,6 +280,7 @@ impl Default for SummarizerConfig {
         // enough that a multi-turn call exercises it, large enough not to thrash.
         Self {
             trigger_after_messages: 20,
+            keep_recent_messages: 4,
         }
     }
 }
@@ -356,7 +361,9 @@ impl UserContextAggregator {
 
     /// Fire the summarizer off the hot path if the context grew past the threshold
     /// (pipecat: summarize on transition, fire-and-forget). Applies the returned
-    /// summary by collapsing the history into a single summary message.
+    /// summary by replacing the *older* messages with one summary message while
+    /// keeping the last [`SummarizerConfig::keep_recent_messages`] turns verbatim, so
+    /// the next LLM run still has the live context.
     fn maybe_summarize(&self, len: usize) {
         use std::sync::atomic::Ordering;
         if len < self.summarizer_cfg.trigger_after_messages {
@@ -374,19 +381,38 @@ impl UserContextAggregator {
         let ctx = self.ctx.clone();
         let summarizer = self.summarizer.clone();
         let in_flight = self.summarize_in_flight.clone();
+        let keep = self.summarizer_cfg.keep_recent_messages;
         tokio::spawn(async move {
             // Snapshot the history under the std lock, drop the guard before await.
             let history = {
                 let c = ctx.lock().unwrap();
                 c.messages.clone()
             };
-            if let Some(summary) = summarizer.summarize(&history).await {
-                // Apply: replace the history with a single summary message (the
-                // pipecat "compress old history into a summary" result).
+            // Summarize only the OLDER messages; keep the last `keep` verbatim. With
+            // nothing old to fold, there is nothing to do.
+            let through = history.len().saturating_sub(keep);
+            if through == 0 {
+                in_flight.store(false, Ordering::SeqCst);
+                return;
+            }
+            if let Some(summary) = summarizer.summarize(&history[..through]).await {
+                // Apply: replace the summarized prefix with one summary message,
+                // keeping the recent tail verbatim. The history may have grown during
+                // the summarize, but leading messages are unchanged, so the same
+                // `through` count still refers to the summarized prefix.
                 let mut c = ctx.lock().unwrap();
-                c.messages = vec![
-                    json!({ "role": "system", "content": format!("Summary so far: {summary}") }),
-                ];
+                let mut cut = through.min(c.messages.len());
+                // Never start the kept tail with an orphan `tool` result (a tool
+                // message must follow its call) — fold any such leading tool messages
+                // into the summarized prefix (the pipecat #3832 tool-pair-split guard).
+                while cut < c.messages.len()
+                    && c.messages[cut].get("role").and_then(Value::as_str) == Some("tool")
+                {
+                    cut += 1;
+                }
+                let summary_msg =
+                    json!({ "role": "system", "content": format!("Summary so far: {summary}") });
+                c.messages.splice(0..cut, std::iter::once(summary_msg));
             }
             in_flight.store(false, Ordering::SeqCst);
         });
@@ -1595,9 +1621,10 @@ mod tests {
     }
 
     /// The summarizer hook fires (fire-and-forget) once the rolling context crosses
-    /// the threshold, and its result collapses the history (summarizer fire).
+    /// the threshold; its result folds the *older* messages into one summary while the
+    /// most-recent turns are kept verbatim (not collapsed away).
     #[tokio::test]
-    async fn summarizer_fires_once_past_threshold_and_compresses() {
+    async fn summarizer_fires_and_keeps_recent_turns_verbatim() {
         let fired = Arc::new(AtomicUsize::new(0));
         let ctx: SharedContext = Arc::new(Mutex::new(RollingContext::default()));
         let pipeline = Pipeline::new(vec![Box::new(UserContextAggregator::new(
@@ -1605,9 +1632,10 @@ mod tests {
             Arc::new(CountingSummarizer {
                 fired: fired.clone(),
             }),
-            // Fire after just 3 messages so the test is quick.
+            // Fire past 5 messages, keeping the last 2 verbatim.
             SummarizerConfig {
-                trigger_after_messages: 3,
+                trigger_after_messages: 5,
+                keep_recent_messages: 2,
             },
         ))]);
         let task = PipelineTask::new(
@@ -1619,7 +1647,7 @@ mod tests {
             vec![],
         );
         let uid: Arc<str> = Arc::from("user");
-        for i in 0..4 {
+        for i in 0..6 {
             task.queue_frame(Frame::Transcription {
                 text: format!("msg {i}"),
                 user_id: uid.clone(),
@@ -1640,13 +1668,24 @@ mod tests {
             fired.load(Ordering::SeqCst) >= 1,
             "summarizer must fire once past the threshold"
         );
-        // The history was compressed to the single summary message.
         let c = ctx.lock().unwrap();
-        assert_eq!(c.messages.len(), 1, "history collapsed to the summary");
+        // Older messages folded into one leading summary...
+        assert_eq!(c.messages[0]["role"], "system");
         assert!(c.messages[0]["content"]
             .as_str()
             .unwrap()
             .contains("compressed"));
+        // ...but the recent turns survive verbatim (the bug was collapsing to 1).
+        assert!(c.messages.len() < 6, "older history was compacted");
+        assert!(
+            c.messages.len() > 1,
+            "recent turns kept verbatim, not collapsed to the summary"
+        );
+        assert_eq!(
+            c.messages.last().unwrap()["content"].as_str().unwrap(),
+            "msg 5",
+            "the latest turn survives verbatim"
+        );
     }
 
     // =======================================================================
