@@ -47,7 +47,8 @@ pub use cascaded::{
     SummarizerConfig,
 };
 pub use context_relay::{
-    ContextCompactor, ContextDigest, ContextRelayConfig, ContextRelayProcessor, VerbatimCompactor,
+    ContextCompactor, ContextDigest, ContextRelayConfig, ContextRelayProcessor, LlmCompactor,
+    VerbatimCompactor,
 };
 pub use parallel::ParallelPipeline;
 pub use runner::PipelineRunner;

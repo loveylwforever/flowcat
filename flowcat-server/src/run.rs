@@ -23,7 +23,10 @@
 use std::sync::Arc;
 
 use flowcat_core::observer::FrameObserver;
-use flowcat_core::pipeline::{CascadedConfig, ContextRelayConfig, VerbatimCompactor};
+use flowcat_core::pipeline::{
+    CascadedConfig, ContextCompactor, ContextRelayConfig, LlmCompactor, VerbatimCompactor,
+};
+use flowcat_core::service::LlmService;
 use flowcat_core::{AgentBrain, FlowcatError, MediaTransport, SessionSource};
 use flowcat_services::factory::{self, ProviderSpec};
 
@@ -91,7 +94,10 @@ pub fn env_spec_resolver(spec: &ProviderSpec) -> Result<ProviderSpec, FlowcatErr
 /// long-call context compaction on the **standalone server** (e.g. to exercise it
 /// over the WebRTC playground with no telephony setup). `FLOWCAT_CONTEXT_RELAY=1`
 /// turns it on with a verbatim (no-summary) compactor — the audio→text re-base still
-/// drops the expensive audio history; `FLOWCAT_CONTEXT_RELAY_MAX_TOKENS` and
+/// drops the expensive audio history. `FLOWCAT_CONTEXT_RELAY_SUMMARIZER=<provider>/<model>`
+/// (e.g. `gemini/gemini-2.0-flash`) instead backs it with a real summarizing LLM (key
+/// from the usual env, falling back to verbatim if it can't be built).
+/// `FLOWCAT_CONTEXT_RELAY_MAX_TOKENS` and
 /// `FLOWCAT_CONTEXT_RELAY_MAX_SESSION_SECS` tune the budget / session-age triggers
 /// (the latter is handy for a quick demo: re-base after N seconds). Returns `None`
 /// when the flag is unset, so the pipeline is unchanged. Realtime/S2S only — the
@@ -103,7 +109,14 @@ pub fn context_relay_from_env() -> Option<ContextRelayConfig> {
     if !enabled {
         return None;
     }
-    let mut cfg = ContextRelayConfig::new(Arc::new(VerbatimCompactor));
+    let compactor: Arc<dyn ContextCompactor> = match summarizer_from_env() {
+        Some(llm) => {
+            tracing::info!("ContextRelay: using an LLM summarizer");
+            Arc::new(LlmCompactor::new(llm))
+        }
+        None => Arc::new(VerbatimCompactor),
+    };
+    let mut cfg = ContextRelayConfig::new(compactor);
     if let Some(n) = std::env::var("FLOWCAT_CONTEXT_RELAY_MAX_TOKENS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -122,6 +135,36 @@ pub fn context_relay_from_env() -> Option<ContextRelayConfig> {
         "ContextRelay enabled (FLOWCAT_CONTEXT_RELAY)"
     );
     Some(cfg)
+}
+
+/// Build the summarizer [`LlmService`] for [`context_relay_from_env`] from
+/// `FLOWCAT_CONTEXT_RELAY_SUMMARIZER` (`<provider>/<model>`, or a bare model that
+/// defaults to the Gemini family). `None` ⇒ no summarizer (the digest stays verbatim).
+/// The key comes from the same env precedence as the call providers; a build error
+/// (e.g. the provider's connector feature isn't compiled) degrades to verbatim.
+fn summarizer_from_env() -> Option<Box<dyn LlmService>> {
+    let raw = std::env::var("FLOWCAT_CONTEXT_RELAY_SUMMARIZER").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (provider, model) = match raw.split_once('/') {
+        Some((p, m)) => (p.to_string(), m.to_string()),
+        None => ("gemini".to_string(), raw.to_string()),
+    };
+    let spec = ProviderSpec {
+        api_key: key_from_env(&provider),
+        provider,
+        model,
+        options: Default::default(),
+    };
+    match factory::llm(&spec) {
+        Ok(llm) => Some(llm),
+        Err(e) => {
+            tracing::warn!(error = %e, "ContextRelay summarizer could not be built; using verbatim");
+            None
+        }
+    }
 }
 
 /// The provider specs a call runs with, after resolution — what the factory builds

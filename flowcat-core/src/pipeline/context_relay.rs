@@ -50,11 +50,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use futures::StreamExt;
+use serde_json::json;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant;
 
 use crate::error::Result;
-use crate::processor::frame::{Frame, StartParams};
+use crate::processor::frame::{Frame, LlmContext, StartParams};
 use crate::processor::{Envelope, FrameProcessor, Link, ProcessorSetup};
+use crate::service::LlmService;
 use crate::transcript::{Speaker, Transcript, TranscriptLine};
 use crate::types::ToolDecl;
 
@@ -88,6 +92,103 @@ pub struct VerbatimCompactor;
 impl ContextCompactor for VerbatimCompactor {
     async fn compact(&self, _older: &[TranscriptLine], _prior: Option<&str>) -> Option<String> {
         None
+    }
+}
+
+/// The default instruction steering [`LlmCompactor`].
+const DEFAULT_COMPACTION_INSTRUCTION: &str = "You compress a voice conversation so it can \
+be carried into a fresh session. Write a concise third-person summary (under ~120 words) \
+capturing who the caller is, what they want, the key facts, decisions and commitments \
+made, and any unresolved items. Fold in the prior summary if given. Output ONLY the \
+summary, with no preamble.";
+
+/// A summarizing [`ContextCompactor`] backed by any [`LlmService`]. It renders the
+/// older turns (plus the `prior` summary, if any) into a prompt asking a — typically
+/// cheap — text LLM for a concise running summary, then returns the model's text.
+///
+/// Provider-agnostic: the embedder injects a concrete [`LlmService`] (e.g. a
+/// Gemini/OpenAI text model built by `flowcat-services`), so `flowcat-core` keeps no
+/// provider dependency. The LLM is held behind an async mutex and started lazily on
+/// first use; ContextRelay only ever runs one compaction at a time, so calls never
+/// contend.
+pub struct LlmCompactor<L: LlmService> {
+    inner: AsyncMutex<LlmCompactorState<L>>,
+    instruction: String,
+}
+
+struct LlmCompactorState<L> {
+    llm: L,
+    started: bool,
+}
+
+impl<L: LlmService> LlmCompactor<L> {
+    /// Build a compactor over `llm` with the default summarization instruction.
+    pub fn new(llm: L) -> Self {
+        Self::with_instruction(llm, DEFAULT_COMPACTION_INSTRUCTION.to_string())
+    }
+
+    /// Build a compactor over `llm` with a custom system `instruction`.
+    pub fn with_instruction(llm: L, instruction: String) -> Self {
+        Self {
+            inner: AsyncMutex::new(LlmCompactorState {
+                llm,
+                started: false,
+            }),
+            instruction,
+        }
+    }
+
+    /// Render the turns + prior summary into the summarization [`LlmContext`].
+    fn build_context(&self, older: &[TranscriptLine], prior: Option<&str>) -> LlmContext {
+        let mut convo = String::new();
+        if let Some(p) = prior {
+            convo.push_str("Summary so far:\n");
+            convo.push_str(p);
+            convo.push_str("\n\nNew turns to fold into the summary:\n");
+        } else {
+            convo.push_str("Conversation so far:\n");
+        }
+        for line in older {
+            convo.push_str(match line.speaker {
+                Speaker::User => "Caller: ",
+                Speaker::Bot => "Agent: ",
+            });
+            convo.push_str(&line.text);
+            convo.push('\n');
+        }
+        LlmContext {
+            messages: vec![
+                json!({ "role": "system", "content": self.instruction }),
+                json!({ "role": "user", "content": convo }),
+            ],
+            tools: Vec::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl<L: LlmService> ContextCompactor for LlmCompactor<L> {
+    async fn compact(&self, older: &[TranscriptLine], prior: Option<&str>) -> Option<String> {
+        if older.is_empty() {
+            return None;
+        }
+        let ctx = self.build_context(older, prior);
+        let mut guard = self.inner.lock().await;
+        if !guard.started {
+            if guard.llm.start(&StartParams::default()).await.is_err() {
+                return None;
+            }
+            guard.started = true;
+        }
+        let mut stream = guard.llm.run_llm(&ctx).await.ok()?;
+        let mut out = String::new();
+        while let Some(frame) = stream.next().await {
+            if let Frame::LlmText(t) = frame {
+                out.push_str(&t);
+            }
+        }
+        let trimmed = out.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 }
 
@@ -554,5 +655,28 @@ mod tests {
             p.should_compact(None, 600),
             Some(CompactionReason::SessionAge)
         );
+    }
+
+    #[tokio::test]
+    async fn llm_compactor_summarizes_older_turns() {
+        use crate::service::MockLlm;
+        // MockLlm echoes the last message's content with a prefix — enough to assert
+        // the compactor renders the turns into the prompt and returns the model text.
+        let c = LlmCompactor::new(MockLlm::new("SUMMARY: "));
+
+        // Empty input → nothing to summarize.
+        assert!(c.compact(&[], None).await.is_none());
+
+        // The older turns are rendered into the prompt and the reply is returned.
+        let out = c.compact(&lines(), None).await.expect("a summary");
+        assert!(out.starts_with("SUMMARY:"));
+        assert!(out.contains("billing"), "the turns reach the summarizer");
+
+        // A prior summary is folded into the prompt.
+        let out2 = c
+            .compact(&lines(), Some("caller greeted, asked about an invoice"))
+            .await
+            .expect("a summary");
+        assert!(out2.contains("caller greeted, asked about an invoice"));
     }
 }

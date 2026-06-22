@@ -2263,4 +2263,254 @@ mod tests {
             "the session-age trigger alone should re-base onto a text digest"
         );
     }
+
+    // --- More real-world scenarios + combinations --------------------------
+
+    use crate::pipeline::context_relay::LlmCompactor;
+    use crate::service::MockLlm;
+
+    /// A `Usage` event carrying `input_tokens` (the live context-size signal).
+    fn usage(input_tokens: u64) -> Usage {
+        Usage {
+            input_tokens: Some(input_tokens),
+            output_tokens: Some(10),
+            total_tokens: Some(input_tokens + 10),
+            extra: None,
+        }
+    }
+
+    /// A two-node brain: the start node offers `go_next` (→ a transition) + end; the
+    /// destination node offers only end. Exercises ContextRelay enriching a *real*
+    /// brain transition reprompt (a distinct path from a self-emitted compaction).
+    struct TransitioningBrain {
+        node: &'static str,
+    }
+    impl TransitioningBrain {
+        fn new() -> Self {
+            Self { node: "start" }
+        }
+    }
+    impl AgentBrain for TransitioningBrain {
+        fn system_prompt(&self) -> String {
+            if self.node == "next" {
+                "Next node prompt.".into()
+            } else {
+                "Start node prompt.".into()
+            }
+        }
+        fn tools(&self) -> Vec<ToolDecl> {
+            let end = ToolDecl {
+                name: END_TOOL.into(),
+                description: "End the call.".into(),
+                params: serde_json::json!({ "type": "object", "properties": {} }),
+            };
+            if self.node == "start" {
+                vec![
+                    ToolDecl {
+                        name: "go_next".into(),
+                        description: "Advance to the next step.".into(),
+                        params: serde_json::json!({ "type": "object", "properties": {} }),
+                    },
+                    end,
+                ]
+            } else {
+                vec![end]
+            }
+        }
+        fn current_node_id(&self) -> String {
+            self.node.to_string()
+        }
+        fn on_tool_call(&mut self, name: &str, _args: &serde_json::Value) -> BrainAction {
+            match name {
+                "go_next" => {
+                    self.node = "next";
+                    BrainAction::Transition {
+                        system_prompt: "Next node prompt.".into(),
+                        tools: self.tools(),
+                        say: None,
+                    }
+                }
+                END_TOOL => BrainAction::End {
+                    disposition: Some("done".into()),
+                },
+                _ => BrainAction::Stay,
+            }
+        }
+        fn is_finished(&self) -> bool {
+            false
+        }
+        fn collected_vars(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    /// A long call that trips the budget twice: the first re-base spawns an LLM
+    /// summary; a later re-base carries that folded summary (not just verbatim).
+    #[tokio::test]
+    async fn context_relay_folds_llm_summary_into_a_later_rebase() {
+        let seen = SeenPrompts::default();
+        let mut cfg =
+            ContextRelayConfig::new(Arc::new(LlmCompactor::new(MockLlm::new("DIGEST:: "))));
+        cfg.max_context_tokens = Some(1_000);
+        cfg.min_turns_between = 1;
+        cfg.keep_recent_turns = 1; // ensure older turns exist to summarize
+        let script = vec![
+            RealtimeEvent::BotText("Hi, this is support. How can I help?".into()),
+            RealtimeEvent::Usage(usage(100)),
+            RealtimeEvent::UserText("My internet has been down since yesterday".into()),
+            RealtimeEvent::Usage(usage(5_000)), // re-base #1 (budget) → spawns the summary
+            RealtimeEvent::UserText("I already tried restarting the router".into()),
+            RealtimeEvent::UserText("nothing helped".into()),
+            RealtimeEvent::Usage(usage(5_000)), // re-base #2 → carries the folded summary
+            RealtimeEvent::ToolCall {
+                id: "fc-end-1".into(),
+                name: END_TOOL.into(),
+                args: serde_json::json!({}),
+            },
+            RealtimeEvent::Closed,
+        ];
+        let s2s = build_s2s_task_with_observers(
+            relay_transport(),
+            CapturingRealtime::new(seen.clone(), script),
+            MockBrain::new(Arc::new(Mutex::new(Vec::new()))),
+            MockSession::new(Arc::new(Mutex::new(Captured::default()))),
+            4242,
+            "tok-abc".into(),
+            TEST_MODEL.into(),
+            Some(cfg),
+            vec![],
+        )
+        .await
+        .expect("build_s2s_task_with_observers");
+        tokio::time::timeout(Duration::from_secs(5), s2s.run())
+            .await
+            .expect("S2S pipeline timed out")
+            .expect("S2S pipeline errored");
+
+        let seen = seen.lock().unwrap().clone();
+        let rebases: Vec<_> = seen
+            .iter()
+            .skip(1)
+            .filter(|(p, _)| p.contains("--- Conversation so far"))
+            .collect();
+        assert!(
+            rebases.len() >= 2,
+            "expected at least two re-bases, got {}",
+            rebases.len()
+        );
+        assert!(
+            rebases.iter().any(|(p, _)| p.contains("DIGEST::")),
+            "a later re-base should carry the LLM-produced summary"
+        );
+    }
+
+    /// A graph transition during a call: ContextRelay enriches the brain's transition
+    /// reprompt so the destination node still has the conversation (it would otherwise
+    /// reopen blank on Gemini). Budget kept high so no self-compaction fires.
+    #[tokio::test]
+    async fn context_relay_enriches_a_brain_transition_with_the_digest() {
+        let seen = SeenPrompts::default();
+        let mut cfg = ContextRelayConfig::new(Arc::new(StubCompactor));
+        cfg.max_context_tokens = Some(1_000_000);
+        let script = vec![
+            RealtimeEvent::BotText("Welcome. Are you a new or existing customer?".into()),
+            RealtimeEvent::UserText("Existing customer, account 12345".into()),
+            RealtimeEvent::Usage(usage(100)),
+            RealtimeEvent::ToolCall {
+                id: "fc-go-1".into(),
+                name: "go_next".into(),
+                args: serde_json::json!({}),
+            },
+            RealtimeEvent::UserText("yes that's right".into()),
+            RealtimeEvent::ToolCall {
+                id: "fc-end-1".into(),
+                name: END_TOOL.into(),
+                args: serde_json::json!({}),
+            },
+            RealtimeEvent::Closed,
+        ];
+        let s2s = build_s2s_task_with_observers(
+            relay_transport(),
+            CapturingRealtime::new(seen.clone(), script),
+            TransitioningBrain::new(),
+            MockSession::new(Arc::new(Mutex::new(Captured::default()))),
+            4242,
+            "tok-abc".into(),
+            TEST_MODEL.into(),
+            Some(cfg),
+            vec![],
+        )
+        .await
+        .expect("build_s2s_task_with_observers");
+        tokio::time::timeout(Duration::from_secs(5), s2s.run())
+            .await
+            .expect("S2S pipeline timed out")
+            .expect("S2S pipeline errored");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen[0].0, "Start node prompt.",
+            "connect uses the start node"
+        );
+        let transition = seen
+            .iter()
+            .find(|(p, _)| p.starts_with("Next node prompt."))
+            .expect("a transition reprompt to the next node");
+        assert!(
+            transition.0.contains("--- Conversation so far"),
+            "the transition carries the conversation digest"
+        );
+        assert!(
+            transition.0.contains("account 12345"),
+            "prior turns are carried into the destination node"
+        );
+    }
+
+    /// The turn-count fallback re-bases even with no token budget (a provider that
+    /// reports usage without `input_tokens`).
+    #[tokio::test]
+    async fn context_relay_rebases_on_turn_count_without_a_budget_signal() {
+        let seen = SeenPrompts::default();
+        let mut cfg = ContextRelayConfig::new(Arc::new(StubCompactor));
+        cfg.max_context_tokens = None; // budget trigger off
+        cfg.trigger_after_turns = Some(2);
+        cfg.min_turns_between = 1;
+        let script = vec![
+            RealtimeEvent::BotText("Hello there!".into()),
+            RealtimeEvent::Usage(usage(50)), // bot turn 1
+            RealtimeEvent::UserText("hi, a quick question".into()),
+            RealtimeEvent::Usage(usage(50)), // bot turn 2 → turn-count fires
+            RealtimeEvent::ToolCall {
+                id: "fc-end-1".into(),
+                name: END_TOOL.into(),
+                args: serde_json::json!({}),
+            },
+            RealtimeEvent::Closed,
+        ];
+        let s2s = build_s2s_task_with_observers(
+            relay_transport(),
+            CapturingRealtime::new(seen.clone(), script),
+            MockBrain::new(Arc::new(Mutex::new(Vec::new()))),
+            MockSession::new(Arc::new(Mutex::new(Captured::default()))),
+            4242,
+            "tok-abc".into(),
+            TEST_MODEL.into(),
+            Some(cfg),
+            vec![],
+        )
+        .await
+        .expect("build_s2s_task_with_observers");
+        tokio::time::timeout(Duration::from_secs(5), s2s.run())
+            .await
+            .expect("S2S pipeline timed out")
+            .expect("S2S pipeline errored");
+
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .skip(1)
+                .any(|(p, _)| p.contains("--- Conversation so far")),
+            "the turn-count trigger re-bases with no token budget"
+        );
+    }
 }
