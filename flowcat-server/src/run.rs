@@ -195,7 +195,7 @@ where
             let model = spec.model.clone();
             let realtime = factory::realtime(&spec)?;
             flowcat_core::pipeline::s2s::build_s2s_task_with_observers(
-                transport, realtime, brain, session, run_id, token, model, observers,
+                transport, realtime, brain, session, run_id, token, model, None, observers,
             )
             .await?
             .run()

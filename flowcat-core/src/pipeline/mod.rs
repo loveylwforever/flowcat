@@ -15,6 +15,7 @@
 //! assembled on this framework.
 
 pub mod cascaded;
+pub mod context_relay;
 pub mod parallel;
 pub mod runner;
 pub mod s2s;
@@ -44,6 +45,9 @@ pub use cascaded::{
     build_cascaded_call_with_observers, build_cascaded_pipeline, build_cascaded_task,
     build_cascaded_task_with_observers, CascadedConfig, CascadedTask, ContextSummarizer,
     SummarizerConfig,
+};
+pub use context_relay::{
+    ContextCompactor, ContextDigest, ContextRelayConfig, ContextRelayProcessor,
 };
 pub use parallel::ParallelPipeline;
 pub use runner::PipelineRunner;
