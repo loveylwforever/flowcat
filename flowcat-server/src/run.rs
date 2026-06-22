@@ -144,14 +144,7 @@ pub fn context_relay_from_env() -> Option<ContextRelayConfig> {
 /// (e.g. the provider's connector feature isn't compiled) degrades to verbatim.
 fn summarizer_from_env() -> Option<Box<dyn LlmService>> {
     let raw = std::env::var("FLOWCAT_CONTEXT_RELAY_SUMMARIZER").ok()?;
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let (provider, model) = match raw.split_once('/') {
-        Some((p, m)) => (p.to_string(), m.to_string()),
-        None => ("gemini".to_string(), raw.to_string()),
-    };
+    let (provider, model) = parse_summarizer_spec(&raw)?;
     let spec = ProviderSpec {
         api_key: key_from_env(&provider),
         provider,
@@ -165,6 +158,23 @@ fn summarizer_from_env() -> Option<Box<dyn LlmService>> {
             None
         }
     }
+}
+
+/// Parse a `FLOWCAT_CONTEXT_RELAY_SUMMARIZER` value into `(provider, model)`:
+/// `<provider>/<model>`, or a bare model that defaults to the Gemini family (most
+/// deployments already hold a `GOOGLE_API_KEY` for the realtime model). Empty/blank
+/// is `None`. Pure (no env) so the parsing is unit-testable.
+fn parse_summarizer_spec(raw: &str) -> Option<(String, String)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(match raw.split_once('/') {
+        Some((p, m)) if !p.trim().is_empty() && !m.trim().is_empty() => {
+            (p.trim().to_string(), m.trim().to_string())
+        }
+        _ => ("gemini".to_string(), raw.to_string()),
+    })
 }
 
 /// The provider specs a call runs with, after resolution — what the factory builds
@@ -344,6 +354,31 @@ mod tests {
         let names = key_env_var_names("deepgram");
         assert!(!names.iter().any(|n| n == "GOOGLE_API_KEY"));
         assert_eq!(names[0], "DEEPGRAM_API_KEY");
+    }
+
+    #[test]
+    fn summarizer_spec_parses_provider_and_model() {
+        // `<provider>/<model>` splits as written.
+        assert_eq!(
+            parse_summarizer_spec("openai/gpt-4o-mini"),
+            Some(("openai".to_string(), "gpt-4o-mini".to_string()))
+        );
+        // A bare model defaults to the Gemini family.
+        assert_eq!(
+            parse_summarizer_spec("gemini-2.0-flash"),
+            Some(("gemini".to_string(), "gemini-2.0-flash".to_string()))
+        );
+        // Whitespace is trimmed; blank is None.
+        assert_eq!(
+            parse_summarizer_spec("  gemini/flash  "),
+            Some(("gemini".to_string(), "flash".to_string()))
+        );
+        assert_eq!(parse_summarizer_spec("   "), None);
+        // A half-empty spec falls back to the bare-model (Gemini) interpretation.
+        assert_eq!(
+            parse_summarizer_spec("/just-a-model"),
+            Some(("gemini".to_string(), "/just-a-model".to_string()))
+        );
     }
 
     // --- Provider/spec resolution (the #21 embedder seam). ----------------------
