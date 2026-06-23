@@ -513,3 +513,82 @@ impl RealtimeKickoff for McpMockRealtime {
         Ok(())
     }
 }
+
+// ---- Capturing RealtimeLlm for the ContextRelay scenario -------------------
+
+/// Shared capture buffer of `(prompt, tool-names)` recorded by [`CapturingRealtime`]
+/// at the initial `connect` and each `update_system`.
+pub(crate) type SeenPrompts = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
+/// A scripted realtime that records the `(prompt, tool-names)` of the initial
+/// `connect` and every `update_system`, in order, into a shared buffer, and emits a
+/// caller-supplied event script. Lets the ContextRelay tests assert that a compaction
+/// re-base carried the conversation digest into the `update_system` prompt (and that
+/// the initial connect did not).
+pub(crate) struct CapturingRealtime {
+    kicked_off: Arc<AtomicBool>,
+    /// `(prompt, tool-names)` for `connect` then each `update_system`, in order.
+    seen: SeenPrompts,
+    script: VecDeque<RealtimeEvent>,
+}
+
+impl CapturingRealtime {
+    pub(crate) fn new(seen: SeenPrompts, script: Vec<RealtimeEvent>) -> Self {
+        Self {
+            kicked_off: Arc::new(AtomicBool::new(false)),
+            seen,
+            script: script.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl RealtimeLlm for CapturingRealtime {
+    async fn connect(&mut self, setup: RealtimeSetup) -> Result<(), FlowcatError> {
+        self.seen.lock().unwrap().push((
+            setup.system_prompt.clone(),
+            setup.tools.iter().map(|t| t.name.clone()).collect(),
+        ));
+        Ok(())
+    }
+
+    async fn send_audio(&mut self, _chunk: AudioChunk) -> Result<(), FlowcatError> {
+        Ok(())
+    }
+
+    async fn update_system(
+        &mut self,
+        prompt: String,
+        tools: Vec<ToolDecl>,
+    ) -> Result<(), FlowcatError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((prompt, tools.iter().map(|t| t.name.clone()).collect()));
+        Ok(())
+    }
+
+    async fn send_tool_result(
+        &mut self,
+        _id: String,
+        _result: serde_json::Value,
+    ) -> Result<(), FlowcatError> {
+        Ok(())
+    }
+
+    async fn next_event(&mut self) -> Option<RealtimeEvent> {
+        while !self.kicked_off.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        self.script.pop_front()
+    }
+}
+
+#[async_trait]
+impl RealtimeKickoff for CapturingRealtime {
+    async fn kickoff(&mut self) -> Result<(), FlowcatError> {
+        self.kicked_off.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
