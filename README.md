@@ -311,11 +311,12 @@ The full feature-flag matrix is in [`FEATURES.md`](FEATURES.md); how the distinc
   FreeSWITCH/Asterisk at all. That's a *deployment choice, not a mandate* — if you
   already run a softswitch, keep it in front and feed audio over the WebSocket
   media transport. ([`SIP-DESIGN.md`](SIP-DESIGN.md).)
-- **Long-call memory for realtime agents (opt-in).** On the speech-to-speech path,
-  `ContextRelay` converts a call's accumulated audio context into a compact text
-  transcript and reseeds the session — so the model re-attends cheap text instead of
-  expensive audio, and the whole conversation survives instead of being evicted to stay
-  under budget. Provider-agnostic; off by default.
+- **Long-call memory that doesn't trade cost for context (opt-in).** Realtime models
+  re-bill the whole conversation every turn as expensive audio; the usual fix bounds that
+  cost by *evicting* the oldest turns — and forgetting them. On the speech-to-speech path,
+  `ContextRelay` instead *converts* the accumulated audio context into a compact text
+  transcript and reseeds the session — so the call stays cost-effective **and** the whole
+  conversation survives. Provider-agnostic; off by default.
   ([`docs/context-relay-evaluation.md`](docs/context-relay-evaluation.md).)
 
 Design details: [`PROCESSOR-DESIGN.md`](PROCESSOR-DESIGN.md) (frozen API +
