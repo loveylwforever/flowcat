@@ -45,4 +45,4 @@ citations, and live transcripts are in the [evaluation doc](context-relay-evalua
 
 **Cost-effective long voice calls that don't forget.** That's ContextRelay.
 
-*Open and shipping. → [your public repo/docs link]*
+*Open and shipping. → https://github.com/AreevAI/flowcat*
